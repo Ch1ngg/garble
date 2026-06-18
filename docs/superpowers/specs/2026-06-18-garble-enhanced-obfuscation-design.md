@@ -11,6 +11,7 @@
 
 | 阶段 | 改动 | 改动量 | 上游冲突风险 |
 |------|------|--------|-------------|
+| P-1 | **清除硬编码 garble 特征（前置必做）** | ~30 行 | 低 |
 | P0 | 自定义字符串加密算法 | ~300 行 | 极低 |
 | P1 | 名字哈希输出格式：前缀 + 哈希 | ~80 行 | 极低 |
 | P2 | 控制流平坦化默认开启 | ~20 行 | 低 |
@@ -38,6 +39,96 @@ git push origin master --force-with-lease
 ```
 
 原则：自定义改动集中到尽量少的文件里，减少冲突面。
+
+---
+
+## P-1：清除硬编码 garble 特征（前置必做）
+
+### 目标
+
+**最低要求**：garble 编译产出的二进制中不能搜到 `garble` 字符串。这是所有改造的前提。
+
+### 问题
+
+当前 garble 在多处硬编码了 `garble` 字符串，这些字符串会直接出现在编译后的二进制中：
+
+| 位置 | 硬编码字符串 | 严重度 |
+|------|-------------|--------|
+| `internal/literals/obfuscators.go:153` | `"garbleExternalKey"` | 致命 |
+| `internal/ctrlflow/ctrlflow.go:24` | `"___garble_import"` | 致命 |
+| `internal/ctrlflow/hardening.go:36` | `"_garble"` | 致命 |
+| `hash.go:88` | `"+garble buildID=_/_/_/"` | 高 |
+
+### 改动方案
+
+#### 1. External Key 变量名（`obfuscators.go:153`）
+
+```go
+// 改前：
+name: "garbleExternalKey" + strconv.Itoa(idx)
+
+// 改后：
+name: "extKey" + strconv.Itoa(idx) + "_" + randomHexString(rand, 4)
+```
+
+用随机后缀替代固定的 `garble` 前缀，每次编译产出不同名字。
+
+#### 2. Import 前缀（`ctrlflow.go:24`）
+
+```go
+// 改前：
+importPrefix = "___garble_import"
+
+// 改后：
+importPrefix = "___imp_"  // 或随机生成
+```
+
+#### 3. Hardening 前缀（`hardening.go:36`）
+
+```go
+// 改前：
+return "_garble" + strconv.FormatUint(rnd.Uint64(), 32)
+
+// 改后：
+return "_" + strconv.FormatUint(rnd.Uint64(), 32)
+```
+
+#### 4. buildID 格式（`hash.go:88`）
+
+```go
+// 改前：
+fmt.Printf("%s +garble buildID=_/_/_/%s\n", line, encodeBuildIDHash(contentID))
+
+// 改后：
+fmt.Printf("%s buildID=_/_/_/%s\n", line, encodeBuildIDHash(contentID))
+```
+
+去掉 `+garble` 前缀，只保留 `buildID=_/_/_/`（这是 Go 编译器的标准格式）。
+
+### 改动文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `internal/literals/obfuscators.go` | **改 1 行** | External Key 变量名加随机后缀 |
+| `internal/ctrlflow/ctrlflow.go` | **改 1 行** | Import 前缀去掉 `garble` |
+| `internal/ctrlflow/hardening.go` | **改 1 行** | Hardening 前缀去掉 `garble` |
+| `hash.go` | **改 1 行** | buildID 格式去掉 `+garble` |
+
+### 验证
+
+```bash
+# 编译一个简单项目
+echo 'package main; func main(){}' > /tmp/test.go
+go run . build -o /tmp/test.bin /tmp/test.go
+
+# 搜索 garble 字符串
+strings /tmp/test.bin | grep -i garble
+# 预期：无输出
+```
+
+### 上游冲突风险
+
+低。每个文件只改一行，且改动是纯重命名，不影响逻辑。
 
 ---
 
@@ -263,6 +354,7 @@ SSA-to-AST 转换（`internal/ssa2ast/func.go`，1193 行）是 garble 最复杂
 ## 实施顺序
 
 ```
+Phase 0: P-1（清除硬编码 garble 特征）→ 验证二进制中无 garble 字符串
 Phase 1: P0（字符串加密）→ 验证 AV 误报是否解决
 Phase 2: P1（名字格式）→ 验证逆向难度提升
 Phase 3: P2（控制流）→ 验证编译正确性
