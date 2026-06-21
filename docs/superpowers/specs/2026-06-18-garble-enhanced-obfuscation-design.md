@@ -12,6 +12,9 @@
 | 阶段 | 改动 | 改动量 | 上游冲突风险 |
 |------|------|--------|-------------|
 | P-1 | **清除硬编码 garble 特征（前置必做）** | ~30 行 | 低 |
+| P-2 | **Go 二进制结构暴露修复** | ~150 行 | 中 |
+| P-3 | **运行时行为特征掩盖** | ~100 行 | 中 |
+| P-4 | **Windows PE 特征处理** | ~200 行 | 中 |
 | P0 | 自定义字符串加密算法 | ~300 行 | 极低 |
 | P1 | 名字哈希输出格式：前缀 + 哈希 | ~80 行 | 极低 |
 | P2 | 控制流平坦化默认开启 | ~20 行 | 低 |
@@ -351,21 +354,195 @@ SSA-to-AST 转换（`internal/ssa2ast/func.go`，1193 行）是 garble 最复杂
 
 ---
 
+## P-2：Go 二进制结构暴露修复
+
+### 目标
+
+消除 Go 编译产物中可被自动化工具识别的结构特征，让工具链（IDA、Ghidra、Detect-It-Easy）无法通过段名、版本字符串等特征识别这是 Go 二进制。
+
+### 问题
+
+Go 编译器会嵌入以下特有结构，garble 完全没动：
+
+| 特征 | 位置 | 可识别性 |
+|------|------|---------|
+| `.gosymtab` 段名 | ELF/PE 段表 | 100% 识别为 Go |
+| `.gopclntab` 段名 | ELF/PE 段表 | 100% 识别为 Go |
+| `.typelink` 段名 | ELF/PE 段表 | 100% 识别为 Go |
+| `.itablink` 段名 | ELF/PE 段表 | 100% 识别为 Go |
+| `go1.26.1` 版本字符串 | runtime 内嵌 | 暴露 Go 版本 |
+| `go.buildid` | ELF note 段 | 追踪编译环境 |
+| 模块路径 | `runtime.modinfo` | 识别项目 |
+
+### 改动方案
+
+#### 1. 段名随机化
+
+在链接阶段（`transformLink`），通过修改 Go linker 源码的段名常量：
+
+```go
+// 改前（Go 编译器内部）：
+const symtabSection = ".gosymtab"
+const pclntabSection = ".gopclntab"
+
+// 改后：
+// 用 linker patch 把段名改为随机值
+const symtabSection = ".data1"    // 伪装成普通数据段
+const pclntabSection = ".data2"   // 伪装成普通数据段
+```
+
+或者更彻底：改为 `.rdata`、`.bss` 等 Windows/Linux 通用段名。
+
+#### 2. 清除版本字符串
+
+在 `runtime_patch.go` 中，扫描 runtime 包的源码，替换 Go 版本字符串：
+
+```go
+// 替换 "go1.26.1" 为 ""
+// 或替换为 "go1.0.0" 这种无意义的值
+```
+
+#### 3. 清除模块信息
+
+在链接阶段清除 `runtime.modinfo` 中的模块路径和版本信息。
+
+#### 4. 清除 `go.buildid`
+
+在链接阶段移除或覆盖 `.note.go.buildid` ELF note。
+
+### 改动文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `runtime_patch.go` | **增强** | 清除版本字符串、模块信息 |
+| `internal/linker/patches/` | **新增 patch** | 段名随机化、buildid 清除 |
+| `transformer.go` transformLink() | **增强** | 调用新的 patch 逻辑 |
+
+### 难度评估
+
+- 段名随机化：中等，需要写 linker patch 文件
+- 版本字符串清除：低，runtime_patch.go 已有类似逻辑
+- 模块信息清除：低，链接器有 `-X` 机制可覆盖
+
+### 上游冲突风险
+
+中等。linker patch 文件上游会随 Go 版本更新而更新，但段名常量本身很少改。
+
+---
+
+## P-3：运行时行为特征掩盖
+
+### 目标
+
+让 `.gopclntab` 的函数边界信息无法被提取，减少运行时可被分析的元数据。
+
+### 问题
+
+`.gopclntab` 中存储了所有函数的起始地址、大小、名称映射。garble 只改了 magic number，但结构本身完整保留。工具更新后仍然可以解析。
+
+### 改动方案
+
+#### 1. `.gopclntab` 深度混淆
+
+在 `runtime_patch.go` 中，不仅改 magic number，还要：
+
+- **打乱函数顺序** — 在 PCLN 表中随机重排函数条目
+- **插入空函数** — 在表中插入无意义的空函数记录
+- **模糊函数名映射** — 把函数名指针指向随机偏移或空字符串
+
+#### 2. 标准库函数名残留处理
+
+garble 不混淆标准库函数名（因为是共享代码）。但可以在最终二进制中：
+
+- 用空字符串替换标准库函数名（不影响运行，因为 Go 运行时不依赖这些名字做函数查找）
+- 或者把函数名替换为混淆后的名字（需要改 linker）
+
+### 改动文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `runtime_patch.go` | **大幅增强** | PCLN 表深度混淆 |
+| `internal/linker/patches/` | **增强** | 函数名清除 patch |
+
+### 难度评估
+
+高。PCLN 表结构复杂，需要深入理解 Go runtime 的 pc-value table 编码格式。
+
+### 上游冲突风险
+
+中高。PCLN 表格式可能随 Go 版本变化。
+
+---
+
+## P-4：Windows PE 特征处理
+
+### 目标
+
+处理 Windows PE 格式特有的 Go 特征，减少在 Windows 平台上的可识别性。
+
+### 问题
+
+| 特征 | 说明 | 可识别性 |
+|------|------|---------|
+| PE 导入表 | IAT 直接列出 Windows API（`CreateFileW`、`WSAConnect` 等） | 暴露功能意图 |
+| 非标准段名 | `.gosymtab`、`.gopclntab` 在 PE 中非常显眼 | 100% 识别为 Go |
+| PE 子系统 | Go 程序通常是 `CONSOLE` 或 `WINDOWS` 子系统 | 中等 |
+
+### 改动方案
+
+#### 1. PE 段名伪装
+
+在链接阶段把 PE 段名改为标准的 Windows PE 段名：
+
+```go
+// 改前：.gosymtab, .gopclntab
+// 改后：.rdata, .pdata（标准 Windows PE 段名）
+```
+
+#### 2. 导入表函数排序随机化
+
+Go linker 生成的导入表按字母序排列，可以随机化顺序。
+
+#### 3. PE 时间戳清除
+
+Go linker 会把编译时间戳写入 PE 头，需要清零或随机化。
+
+### 改动文件
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `internal/linker/patches/` | **新增** | PE 段名伪装、时间戳清除 patch |
+| `transformer.go` transformLink() | **增强** | 平台相关的 PE 处理 |
+
+### 难度评估
+
+中高。需要理解 PE 格式和 Go linker 的 PE 生成逻辑。
+
+### 上游冲突风险
+
+中等。linker patch 需要随 Go 版本更新。
+
+---
+
 ## 实施顺序
 
 ```
-Phase 0: P-1（清除硬编码 garble 特征）→ 验证二进制中无 garble 字符串
-Phase 1: P0（字符串加密）→ 验证 AV 误报是否解决
-Phase 2: P1（名字格式）→ 验证逆向难度提升
-Phase 3: P2（控制流）→ 验证编译正确性
-Phase 4: P3（死代码 + PE）→ 验证整体效果
+Phase 0: P-1（清除硬编码 garble 特征）     → 验证二进制中无 garble 字符串
+Phase 1: P-2（Go 二进制结构暴露修复）      → 验证段名、版本字符串已清除
+Phase 2: P-3（运行时行为特征掩盖）         → 验证 PCLN 表无法解析函数边界
+Phase 3: P-4（Windows PE 特征处理）        → 验证 PE 导入表和段名已伪装
+Phase 4: P0  （自定义字符串加密）          → 验证 AV 误报是否解决
+Phase 5: P1  （名字格式）                  → 验证逆向难度提升
+Phase 6: P2  （控制流平坦化）              → 验证编译正确性
+Phase 7: P3  （死代码 + PE）               → 验证整体效果
 ```
 
-每个阶段完成后独立测试，确认无误再进入下一阶段。
+每个阶段完成后独立测试，确认无误再进入下一阶段。阶段 0-3 是消除已知特征（防御性），阶段 4-7 是增加新混淆（进攻性）。
 
 ## 验证方法
 
 - **AV 测试**：用 VirusTotal 检查 garble 产出的二进制
 - **功能测试**：garble 现有测试套件（`go test ./...`）
 - **逆向测试**：用 `go tool objdump` 和 IDA/Ghidra 尝试分析混淆后的二进制
+- **特征测试**：`strings <binary> | grep -iE "garble|gosymtab|gopclntab|go1\."` 验证无已知特征
 - **性能测试**：对比混淆前后的编译时间和二进制大小
